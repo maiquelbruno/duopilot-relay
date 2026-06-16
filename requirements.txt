@@ -1,0 +1,3 @@
+# DuoPilot BR Relay — dependências
+# Sem dependências externas — usa apenas biblioteca padrão Python
+# (asyncio, json, logging, os)

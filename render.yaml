@@ -1,0 +1,13 @@
+# Configuração do Render.com
+# Coloque este arquivo na raiz do repositório GitHub
+
+services:
+  - type: web
+    name: duopilot-br-relay
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python relay_server.py
+    envVars:
+      - key: PORT
+        value: 10000
