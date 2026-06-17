@@ -60,18 +60,16 @@ async def websocket_handler(request):
                             "motivo": "PIN e papel obrigatórios"}))
                         continue
 
-                    pin_atual   = pin
-                    papel_atual = papel
-
-                    if pin not in sessions:
-                        sessions[pin] = {"captain": None, "fo": None, "aviao": aviao}
-                        stats["total_sessions"] += 1
-
-                    sessao = sessions[pin]
-
                     if papel == "CAPTAIN":
+                        # Captain cria a sessão
+                        if pin not in sessions:
+                            sessions[pin] = {"captain": None, "fo": None, "aviao": aviao}
+                            stats["total_sessions"] += 1
+                        sessao = sessions[pin]
                         sessao["captain"] = ws
                         sessao["aviao"]   = aviao
+                        pin_atual   = pin
+                        papel_atual = papel
                         log.info(f"[{pin}] Captain ({aviao})")
                         await ws.send_str(json.dumps({
                             "tipo": "RELAY_OK",
@@ -79,11 +77,13 @@ async def websocket_handler(request):
                             "mensagem": "Aguardando First Officer..."}))
 
                     elif papel == "FIRST_OFFICER":
-                        if not sessao["captain"]:
+                        # FO só pode entrar em sessão já existente com Captain ativo
+                        sessao = sessions.get(pin)
+                        if not sessao or not sessao.get("captain"):
                             await ws.send_str(json.dumps({
                                 "tipo": "ERRO",
                                 "motivo": "PIN inválido ou Captain não encontrado."}))
-                            continue
+                            continue  # pin_atual permanece None — sessão não registrada
 
                         if aviao and sessao["aviao"] and aviao != sessao["aviao"]:
                             await ws.send_str(json.dumps({
@@ -92,6 +92,8 @@ async def websocket_handler(request):
                             continue
 
                         sessao["fo"] = ws
+                        pin_atual   = pin
+                        papel_atual = papel
                         log.info(f"[{pin}] First Officer conectado — sessão completa!")
 
                         await ws.send_str(json.dumps({
