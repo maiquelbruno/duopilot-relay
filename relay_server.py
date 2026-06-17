@@ -1,10 +1,8 @@
 """
 =============================================================
-  DUOPILOT BR — Servidor Relay WebSocket
+  DUOPILOT BR — Servidor Relay
   Deploy: Render.com (free tier)
-
-  Usa WebSocket sobre HTTP — compatível com Render free.
-  Instalar: pip install websockets
+  Usa aiohttp — responde health checks HTTP e WebSocket
 =============================================================
 """
 
@@ -12,7 +10,7 @@ import asyncio
 import json
 import logging
 import os
-import websockets
+from aiohttp import web
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,110 +20,114 @@ log = logging.getLogger("DuoPilotRelay")
 
 PORT = int(os.environ.get("PORT", 10000))
 
-# Sessões ativas: { pin: {"captain": ws, "fo": ws, "aviao": str} }
 sessions = {}
 stats = {"total_sessions": 0, "total_packets": 0}
 
 
-async def handle_client(websocket):
-    addr = websocket.remote_address
+async def health(request):
+    """Health check para o Render — responde GET e HEAD em /"""
+    return web.Response(text="DuoPilot BR Relay OK")
+
+
+async def websocket_handler(request):
+    """Handler principal WebSocket"""
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    addr = request.remote
     log.info(f"Nova conexão: {addr}")
-    pin_atual  = None
+    pin_atual   = None
     papel_atual = None
 
     try:
-        async for message in websocket:
-            try:
-                msg = json.loads(message)
-            except json.JSONDecodeError:
-                continue
-
-            tipo = msg.get("tipo")
-
-            # ── JOIN — cliente apresenta PIN e papel ───────────────
-            if tipo == "RELAY_JOIN":
-                pin   = msg.get("pin")
-                papel = msg.get("papel")
-                aviao = msg.get("aviao", "")
-
-                if not pin or not papel:
-                    await websocket.send(json.dumps({
-                        "tipo": "ERRO", "motivo": "PIN e papel obrigatórios"}))
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    obj = json.loads(msg.data)
+                except json.JSONDecodeError:
                     continue
 
-                pin_atual   = pin
-                papel_atual = papel
+                tipo = obj.get("tipo")
 
-                if pin not in sessions:
-                    sessions[pin] = {"captain": None, "fo": None, "aviao": aviao}
-                    stats["total_sessions"] += 1
+                if tipo == "RELAY_JOIN":
+                    pin   = obj.get("pin")
+                    papel = obj.get("papel")
+                    aviao = obj.get("aviao", "")
 
-                sessao = sessions[pin]
-
-                if papel == "CAPTAIN":
-                    sessao["captain"] = websocket
-                    sessao["aviao"]   = aviao
-                    log.info(f"[{pin}] Captain conectado ({aviao})")
-                    await websocket.send(json.dumps({
-                        "tipo": "RELAY_OK",
-                        "papel": "CAPTAIN",
-                        "mensagem": "Aguardando First Officer..."}))
-
-                elif papel == "FIRST_OFFICER":
-                    if sessao["captain"] is None:
-                        await websocket.send(json.dumps({
+                    if not pin or not papel:
+                        await ws.send_str(json.dumps({
                             "tipo": "ERRO",
-                            "motivo": "Nenhum Captain nesta sessão. Verifique o PIN."}))
+                            "motivo": "PIN e papel obrigatórios"}))
                         continue
 
-                    if aviao and sessao["aviao"] and aviao != sessao["aviao"]:
-                        await websocket.send(json.dumps({
-                            "tipo": "ERRO",
-                            "motivo": f"Avião incompatível: {aviao} vs {sessao['aviao']}"}))
+                    pin_atual   = pin
+                    papel_atual = papel
+
+                    if pin not in sessions:
+                        sessions[pin] = {"captain": None, "fo": None, "aviao": aviao}
+                        stats["total_sessions"] += 1
+
+                    sessao = sessions[pin]
+
+                    if papel == "CAPTAIN":
+                        sessao["captain"] = ws
+                        sessao["aviao"]   = aviao
+                        log.info(f"[{pin}] Captain ({aviao})")
+                        await ws.send_str(json.dumps({
+                            "tipo": "RELAY_OK",
+                            "papel": "CAPTAIN",
+                            "mensagem": "Aguardando First Officer..."}))
+
+                    elif papel == "FIRST_OFFICER":
+                        if not sessao["captain"]:
+                            await ws.send_str(json.dumps({
+                                "tipo": "ERRO",
+                                "motivo": "PIN inválido ou Captain não encontrado."}))
+                            continue
+
+                        if aviao and sessao["aviao"] and aviao != sessao["aviao"]:
+                            await ws.send_str(json.dumps({
+                                "tipo": "ERRO",
+                                "motivo": f"Avião incompatível: {aviao} vs {sessao['aviao']}"}))
+                            continue
+
+                        sessao["fo"] = ws
+                        log.info(f"[{pin}] First Officer conectado — sessão completa!")
+
+                        await ws.send_str(json.dumps({
+                            "tipo": "RELAY_OK",
+                            "papel": "FIRST_OFFICER",
+                            "aviao": sessao["aviao"],
+                            "mensagem": "Conectado ao Captain."}))
+
+                        if sessao["captain"]:
+                            await sessao["captain"].send_str(json.dumps({
+                                "tipo": "FO_CONECTADO",
+                                "mensagem": "First Officer conectado."}))
+
+                elif tipo in ("DR", "CMD") and pin_atual:
+                    sessao = sessions.get(pin_atual)
+                    if not sessao:
                         continue
+                    stats["total_packets"] += 1
+                    parceiro = sessao.get("fo") if papel_atual == "CAPTAIN" \
+                               else sessao.get("captain")
+                    if parceiro and not parceiro.closed:
+                        await parceiro.send_str(json.dumps(obj))
 
-                    sessao["fo"] = websocket
-                    log.info(f"[{pin}] First Officer conectado — sessão completa!")
+                elif tipo == "PING":
+                    await ws.send_str(json.dumps({"tipo": "PONG"}))
 
-                    await websocket.send(json.dumps({
-                        "tipo": "RELAY_OK",
-                        "papel": "FIRST_OFFICER",
-                        "aviao": sessao["aviao"],
-                        "mensagem": "Conectado ao Captain."}))
+            elif msg.type == web.WSMsgType.ERROR:
+                log.error(f"Erro WS: {ws.exception()}")
 
-                    if sessao["captain"]:
-                        await sessao["captain"].send(json.dumps({
-                            "tipo": "FO_CONECTADO",
-                            "mensagem": "First Officer conectado."}))
-
-            # ── DADOS — bridge para o parceiro ────────────────────
-            elif tipo in ("DR", "CMD") and pin_atual:
-                sessao = sessions.get(pin_atual)
-                if not sessao:
-                    continue
-
-                stats["total_packets"] += 1
-                parceiro = sessao.get("fo") if papel_atual == "CAPTAIN" else sessao.get("captain")
-
-                if parceiro:
-                    try:
-                        await parceiro.send(json.dumps(msg))
-                    except Exception:
-                        log.warning(f"[{pin_atual}] Parceiro desconectou.")
-
-            # ── PING ──────────────────────────────────────────────
-            elif tipo == "PING":
-                await websocket.send(json.dumps({"tipo": "PONG"}))
-
-    except websockets.exceptions.ConnectionClosed:
-        pass
     except Exception as e:
-        log.error(f"Erro com {addr}: {e}")
+        log.error(f"Erro: {e}")
     finally:
         if pin_atual and pin_atual in sessions:
             sessao = sessions[pin_atual]
             parceiro = None
-
+            msg_saiu = ""
             if papel_atual == "CAPTAIN":
                 sessao["captain"] = None
                 parceiro = sessao.get("fo")
@@ -134,35 +136,39 @@ async def handle_client(websocket):
                 sessao["fo"] = None
                 parceiro = sessao.get("captain")
                 msg_saiu = "First Officer desconectou."
-
-            if parceiro:
-                try:
-                    await parceiro.send(json.dumps({
-                        "tipo": "PARCEIRO_SAIU",
-                        "mensagem": msg_saiu}))
-                except Exception:
-                    pass
-
-            if sessao["captain"] is None and sessao["fo"] is None:
+            if parceiro and not parceiro.closed:
+                await parceiro.send_str(json.dumps({
+                    "tipo": "PARCEIRO_SAIU",
+                    "mensagem": msg_saiu}))
+            if not sessao["captain"] and not sessao["fo"]:
                 del sessions[pin_atual]
                 log.info(f"[{pin_atual}] Sessão encerrada.")
-
         log.info(f"Conexão encerrada: {addr}")
+
+    return ws
 
 
 async def status_periodico():
     while True:
         await asyncio.sleep(300)
         log.info(f"STATUS — Sessões: {len(sessions)} | "
-                 f"Total: {stats['total_sessions']} | Pacotes: {stats['total_packets']}")
+                 f"Total: {stats['total_sessions']} | "
+                 f"Pacotes: {stats['total_packets']}")
 
 
 async def main():
-    log.info(f"DuoPilot BR Relay WebSocket iniciando na porta {PORT}...")
-    async with websockets.serve(handle_client, "0.0.0.0", PORT):
-        log.info(f"Relay pronto na porta {PORT}")
-        asyncio.create_task(status_periodico())
-        await asyncio.Future()  # roda para sempre
+    app = web.Application()
+    app.router.add_get("/",        health)
+    app.router.add_get("/health",  health)
+    app.router.add_get("/ws",      websocket_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info(f"DuoPilot BR Relay pronto na porta {PORT}")
+    asyncio.create_task(status_periodico())
+    await asyncio.Future()
 
 
 if __name__ == "__main__":
